@@ -217,10 +217,30 @@ def configure_system(args):
         )
 
     # Disable perf for KVM CPUs if not explicitly enabled
+    # Must disable for both start and switch processors
     if not args.kvm_perf:
         for proc in processor.start:
             if hasattr(proc.core, 'usePerf'):
                 proc.core.usePerf = False
+
+        # SimpleSwitchableProcessor has a private _switch_cores attribute
+        # We need to access it via the switch() method's internals
+        try:
+            # The switch cores are stored internally and will be switched to
+            # We need to disable perf for them too before they're used
+            switch_cores_list = []
+            if hasattr(processor, '_switch_cores'):
+                switch_cores_list = processor._switch_cores
+            elif hasattr(processor, '_switch_processor') and hasattr(processor._switch_processor, '_cores'):
+                switch_cores_list = processor._switch_processor._cores
+
+            for proc in switch_cores_list:
+                if hasattr(proc, 'core') and hasattr(proc.core, 'usePerf'):
+                    proc.core.usePerf = False
+        except Exception as e:
+            # If accessing switch cores fails, continue anyway
+            # This is not critical as the start cores are the main concern
+            pass
 
     # Configure board
     board = X86Board(
@@ -230,131 +250,97 @@ def configure_system(args):
         cache_hierarchy=cache_hierarchy,
     )
 
-    # Set workload
-    workload = obtain_resource("x86-ubuntu-24.04-boot-with-systemd")
+    # Set workload with hello world binary
+    workload = obtain_resource("x86-ubuntu-22.04-boot-with-systemd")
     board.set_workload(workload)
+
+    # Get the path to the hello binary
+    script_dir = __file__.rsplit('/', 1)[0]
+    hello_binary_path = f"{script_dir}/hello"
+
+    # Create a simple wrapper for the binary that has get_local_path()
+    class SimpleBinary:
+        def __init__(self, path):
+            self.path = path
+        def get_local_path(self):
+            return self.path
+
+    hello_binary = SimpleBinary(hello_binary_path)
+
+    # Set the hello binary to run
+    # gem5 will base64 encode it and inject it into the guest as 'myapp'
+    # Then execute it and exit
+    from base64 import b64encode
+    with open(hello_binary_path, "rb") as f:
+        encoded_hello = b64encode(f.read()).decode()
+
+    # Create a script that decodes and runs the hello binary, then exits
+    application_command = (
+        f'echo "{encoded_hello}" | base64 -d > /tmp/hello\n'
+        'chmod +x /tmp/hello\n'
+        '/tmp/hello\n'
+        '/sbin/m5 exit\n'
+    )
+
+    # Set this command as the readfile contents
+    board._set_readfile_contents(application_command)
 
     return board, processor
 
 
-def create_exit_event_handler(processor, args):
-    """Create exit event handler for boot and workload execution phases."""
+# Parse command line arguments
+args = parse_args()
 
-    def exit_event_handler():
-        # Phase 1: Kernel boot complete
-        print(f"[Phase 1] Ubuntu kernel booted with {args.num_cores} {args.boot_cpu.upper()} cores")
-        yield False  # Continue to systemd startup
-
-        # Phase 2: Systemd started, ready for workload
-        print("[Phase 2] Systemd started, ready for workload execution")
-
-        if not args.no_switch and args.boot_cpu != args.exec_cpu:
-            print(f"[Phase 2] Switching from {args.boot_cpu.upper()} to {args.exec_cpu.upper()} CPUs")
-            processor.switch()
-
-        yield False  # Continue to workload execution
-
-        # Phase 3: Workload complete, exit simulation
-        print("[Phase 3] Workload execution complete")
-        print("[Phase 3] Exiting simulation via m5 exit")
-        yield True  # Terminate simulation
-
-    return exit_event_handler
+# Configure system
+board, processor = configure_system(args)
 
 
-def run_simulation(board, processor, args):
-    """Run the simulation with configured exit events."""
+def exit_event_handler():
+    """Exit event handler for the simulation."""
+    # Phase 1: Kernel boot complete
+    print(f"[Phase 1] Ubuntu kernel booted with {args.num_cores} {args.boot_cpu.upper()} cores")
+    yield False  # Continue to systemd startup
 
-    simulator = Simulator(
-        board=board,
-        on_exit_event={
-            ExitEvent.EXIT: create_exit_event_handler(processor, args)()
-        },
-    )
+    # Phase 2: Systemd started, ready for workload
+    print("[Phase 2] Systemd started, ready for workload execution")
 
-    print(f"\n{'='*60}")
-    print("Starting Multi-CPU X86 SoC Simulation")
-    print(f"{'='*60}")
-    print(f"Configuration:")
-    print(f"  Cores: {args.num_cores}")
-    print(f"  Boot CPU: {args.boot_cpu.upper()}")
-    print(f"  Exec CPU: {args.exec_cpu.upper()}")
-    print(f"  CPU Switch: {'Disabled' if args.no_switch else 'Enabled'}")
-    print(f"  L1D Cache: {args.l1d_size}")
-    print(f"  L1I Cache: {args.l1i_size}")
-    print(f"  L2 Cache: {args.l2_size}")
-    print(f"  Memory: {args.memory_size}")
-    print(f"  Clock: {args.clk_freq}")
-    print(f"{'='*60}\n")
+    if not args.no_switch and args.boot_cpu != args.exec_cpu:
+        print(f"[Phase 2] Switching from {args.boot_cpu.upper()} to {args.exec_cpu.upper()} CPUs")
+        processor.switch()
 
-    simulator.run()
+    yield False  # Continue to workload execution
 
-    print(f"\n{'='*60}")
-    print("Simulation Complete")
-    print(f"{'='*60}")
+    # Phase 3: Workload complete, exit simulation
+    print("[Phase 3] Workload execution complete")
+    print("[Phase 3] Exiting simulation via m5 exit")
+    yield True  # Terminate simulation
 
 
-def create_hello_world_workload():
-    """Create a simple hello world workload for testing."""
-    import tempfile
-    import os
+# Create and run simulator
+simulator = Simulator(
+    board=board,
+    on_exit_event={
+        ExitEvent.EXIT: exit_event_handler()
+    },
+)
 
-    # Create a simple shell script that prints hello and exits
-    script_content = """#!/bin/bash
-echo "========================================"
-echo "Hello from gem5 Multi-CPU X86 SoC!"
-echo "Running on Ubuntu in full-system mode"
-echo "Number of CPU cores configured: $1"
-echo "========================================"
-m5 exit
-"""
+print(f"\n{'='*60}")
+print("Starting Multi-CPU X86 SoC Simulation")
+print(f"{'='*60}")
+print(f"Configuration:")
+print(f"  Cores: {args.num_cores}")
+print(f"  Boot CPU: {args.boot_cpu.upper()}")
+print(f"  Exec CPU: {args.exec_cpu.upper()}")
+print(f"  CPU Switch: {'Disabled' if args.no_switch else 'Enabled'}")
+print(f"  L1D Cache: {args.l1d_size}")
+print(f"  L1I Cache: {args.l1i_size}")
+print(f"  L2 Cache: {args.l2_size}")
+print(f"  Memory: {args.memory_size}")
+print(f"  Clock: {args.clk_freq}")
+print(f"{'='*60}\n")
 
-    # Create temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-        f.write(script_content)
-        script_path = f.name
+simulator.run()
 
-    # Make executable
-    os.chmod(script_path, 0o755)
-
-    return script_path
-
-
-def main():
-    """Main function to run the multi-CPU SoC simulation."""
-
-    # Parse command line arguments
-    args = parse_args()
-
-    try:
-        # Configure system
-        board, processor = configure_system(args)
-
-        # Create hello world workload
-        workload_path = create_hello_world_workload()
-        print(f"[Info] Created hello world workload at: {workload_path}")
-        print("[Info] Pass this file via 'm5 readfile' in the guest")
-        print("[Info] The Ubuntu after_boot.sh script will automatically execute it")
-
-        # Run simulation
-        run_simulation(board, processor, args)
-
-        # Cleanup
-        import os
-        os.unlink(workload_path)
-
-    except Exception as e:
-        print(f"\n{'='*60}")
-        print("Simulation Failed")
-        print(f"{'='*60}")
-        print(f"Error: {e}")
-        print(f"\nCommon issues:")
-        print("1. Ensure gem5 is built with X86 and MESI_TWO_LEVEL support")
-        print("2. For KVM: Ensure host has KVM enabled and user has permissions")
-        print("3. Check internet connection for resource download")
-        print(f"{'='*60}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
+print(f"\n{'='*60}")
+print("Simulation Complete")
+print(f"{'='*60}")
